@@ -1,0 +1,1271 @@
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const { exec } = require('child_process');
+const ytdl = require('ytdl-core');
+const ytdlDiscord = require('ytdl-core-discord');
+const youtubeDl = require('youtube-dl-exec');
+const app = express();
+const PORT = process.env.PORT || 5001; // Changed from 5000 to 5001 to avoid conflicts
+
+// Middleware
+app.use(cors({
+  origin: 'http://localhost:3000',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json());
+app.use(express.static(path.join(__dirname, '../build')));
+
+// Create temp directory if it doesn't exist
+const tempDir = path.join(__dirname, 'temp');
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir);
+}
+
+// Helper function to clean up temp files
+const cleanupTempFiles = () => {
+  fs.readdir(tempDir, (err, files) => {
+    if (err) return console.error(err);
+    
+    // Delete files older than 1 hour
+    const now = Date.now();
+    files.forEach(file => {
+      const filePath = path.join(tempDir, file);
+      fs.stat(filePath, (err, stats) => {
+        if (err) return console.error(err);
+        
+        // If file is older than 1 hour, delete it
+        if (now - stats.mtime.getTime() > 3600000) {
+          fs.unlink(filePath, err => {
+            if (err) console.error(err);
+          });
+        }
+      });
+    });
+  });
+};
+
+// Clean up temp files every hour
+setInterval(cleanupTempFiles, 3600000);
+
+// Test endpoint to verify server is working
+app.get('/api/test', (req, res) => {
+  res.json({ status: 'ok', message: 'Server is running correctly' });
+});
+
+// API endpoint to get video info
+app.post('/api/info', async (req, res) => {
+  const { url } = req.body;
+  
+  if (!url) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+  
+  try {
+    // Detect platform
+    let platform;
+    if (url.includes('youtube.com') || url.includes('youtu.be')) {
+      platform = 'youtube';
+      
+      try {
+        // Clean the URL to remove any extra parameters
+        let videoId, cleanUrl;
+        try {
+          videoId = ytdl.getVideoID(url);
+          cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
+          console.log('Processing YouTube video ID:', videoId);
+        } catch (idError) {
+          console.error('Error extracting video ID:', idError);
+          // If we can't extract the ID, use the original URL
+          cleanUrl = url;
+        }
+        
+        // Try to get info using ytdl-core first
+        let info;
+        try {
+          info = await ytdl.getInfo(cleanUrl, {
+            requestOptions: {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9'
+              }
+            }
+          });
+        } catch (ytdlError) {
+          console.error('ytdl-core error:', ytdlError);
+          
+          // If ytdl-core fails, try using youtube-dl-exec
+          try {
+            console.log('Falling back to youtube-dl-exec...');
+            const ytDlInfo = await youtubeDl(cleanUrl, {
+              dumpSingleJson: true,
+              noWarnings: true,
+              noCallHome: true,
+              preferFreeFormats: true,
+              youtubeSkipDashManifest: true
+            });
+            
+            // Convert youtube-dl-exec format to match ytdl-core format
+            info = {
+              videoDetails: {
+                title: ytDlInfo.title,
+                lengthSeconds: ytDlInfo.duration,
+                thumbnails: [{ url: ytDlInfo.thumbnail }],
+                author: { name: ytDlInfo.uploader }
+              },
+              formats: ytDlInfo.formats.map(format => ({
+                qualityLabel: format.height ? `${format.height}p` : null,
+                hasVideo: format.vcodec !== 'none',
+                hasAudio: format.acodec !== 'none',
+                audioBitrate: format.abr,
+                contentLength: format.filesize,
+                container: format.ext
+              }))
+            };
+          } catch (ytDlExecError) {
+            console.error('youtube-dl-exec error:', ytDlExecError);
+            throw new Error('Failed to retrieve video information using multiple methods');
+          }
+        }
+        
+        if (!info || !info.videoDetails) {
+          throw new Error('Failed to retrieve video details');
+        }
+        
+        return res.json({
+          platform,
+          videoInfo: {
+            title: info.videoDetails.title || 'Unknown Title',
+            thumbnail: info.videoDetails.thumbnails && info.videoDetails.thumbnails.length > 0 
+              ? info.videoDetails.thumbnails[info.videoDetails.thumbnails.length - 1].url 
+              : 'https://via.placeholder.com/640x360/4a6cf7/ffffff?text=YouTube+Video',
+            duration: info.videoDetails.lengthSeconds 
+              ? formatDuration(parseInt(info.videoDetails.lengthSeconds)) 
+              : '0:00',
+            author: info.videoDetails.author ? info.videoDetails.author.name : 'Unknown Author',
+          },
+          formats: getYouTubeFormats(info.formats)
+        });
+      } catch (ytError) {
+        console.error('YouTube specific error:', ytError);
+        
+        // Return a fallback response for demonstration purposes
+        return res.json({
+          platform,
+          videoInfo: {
+            title: 'YouTube Video (Error retrieving details)',
+            thumbnail: 'https://via.placeholder.com/640x360/4a6cf7/ffffff?text=YouTube+Video',
+            duration: '0:00',
+            author: 'Unknown',
+          },
+          formats: [
+            { id: 'yt-mp4-720', format: 'mp4', quality: '720p', type: 'video', size: 'Unknown' },
+            { id: 'yt-mp4-480', format: 'mp4', quality: '480p', type: 'video', size: 'Unknown' },
+            { id: 'yt-mp3-high', format: 'mp3', quality: 'High', type: 'audio', size: 'Unknown' }
+          ]
+        });
+      }
+    } else if (url.includes('tiktok.com')) {
+      platform = 'tiktok';
+      
+      // For TikTok, we'd need to implement a custom solution
+      // This is a placeholder for demonstration
+      return res.json({
+        platform,
+        videoInfo: {
+          title: 'TikTok Video',
+          thumbnail: 'https://via.placeholder.com/640x360/4a6cf7/ffffff?text=TikTok+Video',
+          duration: '0:30',
+          author: 'TikTok User',
+        },
+        formats: [
+          { id: 'tt-mp4-hd-nowm', format: 'mp4', quality: 'HD', type: 'video', watermark: false, size: '8.7 MB' },
+          { id: 'tt-mp4-hd-wm', format: 'mp4', quality: 'HD', type: 'video', watermark: true, size: '8.7 MB' },
+          { id: 'tt-mp4-sd-nowm', format: 'mp4', quality: 'SD', type: 'video', watermark: false, size: '5.3 MB' },
+          { id: 'tt-mp4-sd-wm', format: 'mp4', quality: 'SD', type: 'video', watermark: true, size: '5.3 MB' },
+          { id: 'tt-mp3', format: 'mp3', quality: 'High', type: 'audio', size: '1.8 MB' }
+        ]
+      });
+    } else if (url.includes('facebook.com') || url.includes('fb.watch')) {
+      platform = 'facebook';
+      
+      // For Facebook, we'd need to implement a custom solution
+      // This is a placeholder for demonstration
+      return res.json({
+        platform,
+        videoInfo: {
+          title: 'Facebook Video',
+          thumbnail: 'https://via.placeholder.com/640x360/4a6cf7/ffffff?text=Facebook+Video',
+          duration: '2:15',
+          author: 'Facebook User',
+        },
+        formats: [
+          { id: 'fb-mp4-hd', format: 'mp4', quality: 'HD', type: 'video', size: '18.2 MB' },
+          { id: 'fb-mp4-sd', format: 'mp4', quality: 'SD', type: 'video', size: '9.6 MB' },
+          { id: 'fb-mp3', format: 'mp3', quality: 'High', type: 'audio', size: '2.9 MB' }
+        ]
+      });
+    } else {
+      return res.status(400).json({ error: 'Unsupported platform' });
+    }
+  } catch (error) {
+    console.error('Error fetching video info:', error.message);
+    console.error('Stack trace:', error.stack);
+    return res.status(500).json({
+      error: 'Failed to fetch video information',
+      details: error.message
+    });
+  }
+});
+
+// API endpoint to download YouTube videos
+app.get('/api/download/youtube', async (req, res) => {
+  const { url, format, quality } = req.query;
+  
+  if (!url) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+  
+  try {
+    // Clean the URL to remove any extra parameters
+    let videoId, cleanUrl;
+    try {
+      videoId = ytdl.getVideoID(url);
+      cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      console.log('Processing YouTube video ID:', videoId);
+    } catch (idError) {
+      console.error('Error extracting video ID:', idError);
+      // If we can't extract the ID, use the original URL
+      cleanUrl = url;
+    }
+    
+    // Try to get info using ytdl-core first
+    let info;
+    let useYoutubeDl = false;
+    
+    try {
+      info = await ytdl.getInfo(cleanUrl, {
+        requestOptions: {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9'
+          }
+        }
+      });
+    } catch (ytdlError) {
+      console.error('ytdl-core error:', ytdlError);
+      
+      // If ytdl-core fails, try using youtube-dl-exec
+      try {
+        console.log('Falling back to youtube-dl-exec...');
+        const ytDlInfo = await youtubeDl(cleanUrl, {
+          dumpSingleJson: true,
+          noWarnings: true,
+          noCallHome: true,
+          preferFreeFormats: true,
+          youtubeSkipDashManifest: true
+        });
+        
+        // Convert youtube-dl-exec format to match ytdl-core format
+        info = {
+          videoDetails: {
+            title: ytDlInfo.title,
+            lengthSeconds: ytDlInfo.duration,
+            thumbnails: [{ url: ytDlInfo.thumbnail }],
+            author: { name: ytDlInfo.uploader }
+          },
+          formats: ytDlInfo.formats.map(format => ({
+            qualityLabel: format.height ? `${format.height}p` : null,
+            hasVideo: format.vcodec !== 'none',
+            hasAudio: format.acodec !== 'none',
+            audioBitrate: format.abr,
+            contentLength: format.filesize,
+            container: format.ext,
+            url: format.url
+          }))
+        };
+        
+        useYoutubeDl = true;
+      } catch (ytDlExecError) {
+        console.error('youtube-dl-exec error:', ytDlExecError);
+        throw new Error('Failed to retrieve video information using multiple methods');
+      }
+    }
+    
+    if (!info || !info.videoDetails) {
+      throw new Error('Could not retrieve video details');
+    }
+    
+    const videoTitle = info.videoDetails.title.replace(/[^\w\s]/gi, '') || 'video';
+    
+    if (format === 'mp3') {
+      // Download as MP3 (audio only)
+      const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
+      
+      if (!audioFormats || audioFormats.length === 0) {
+        throw new Error('No audio formats available for this video');
+      }
+      
+      let selectedFormat;
+      
+      if (quality === 'High') {
+        selectedFormat = audioFormats.reduce((prev, curr) =>
+          (prev.audioBitrate || 0) > (curr.audioBitrate || 0) ? prev : curr
+        );
+      } else {
+        selectedFormat = audioFormats.reduce((prev, curr) =>
+          (prev.audioBitrate || 0) < (curr.audioBitrate || 0) ? prev : curr
+        );
+      }
+      
+      if (!selectedFormat) {
+        throw new Error('Could not select an appropriate audio format');
+      }
+      
+      const fileName = `${videoTitle}.mp3`;
+      const filePath = path.join(tempDir, fileName);
+      
+      res.header('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.header('Content-Type', 'audio/mpeg');
+      
+      if (useYoutubeDl) {
+        // If we're using youtube-dl-exec, download directly from the URL
+        const fileUrl = selectedFormat.url;
+        
+        if (!fileUrl) {
+          throw new Error('No download URL available');
+        }
+        
+        // Use youtube-dl-exec to download the file
+        const downloadProcess = youtubeDl.exec(cleanUrl, {
+          extractAudio: true,
+          audioFormat: 'mp3',
+          audioQuality: quality === 'High' ? 0 : 5, // 0 is best, 9 is worst
+          output: filePath
+        });
+        
+        downloadProcess.then(() => {
+          const fileStream = fs.createReadStream(filePath);
+          
+          fileStream.on('error', (err) => {
+            console.error('File read error:', err);
+            if (!res.headersSent) {
+              return res.status(500).json({
+                error: 'Failed to read audio file',
+                details: err.message
+              });
+            }
+          });
+          
+          fileStream.pipe(res);
+          
+          fileStream.on('end', () => {
+            // Delete the file after sending
+            fs.unlink(filePath, err => {
+              if (err) console.error('Error deleting temp file:', err);
+            });
+          });
+        }).catch((err) => {
+          console.error('youtube-dl-exec download error:', err);
+          if (!res.headersSent) {
+            return res.status(500).json({
+              error: 'Failed to download audio',
+              details: err.message
+            });
+          }
+        });
+      } else {
+        // Use ytdl-core for downloading
+        const downloadStream = ytdl(cleanUrl, {
+          format: selectedFormat,
+          requestOptions: {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            }
+          }
+        });
+        
+        // Handle download stream errors
+        downloadStream.on('error', (err) => {
+          console.error('Download stream error:', err);
+          if (!res.headersSent) {
+            return res.status(500).json({
+              error: 'Failed to download audio',
+              details: err.message
+            });
+          }
+        });
+        
+        const fileWriteStream = fs.createWriteStream(filePath);
+        
+        fileWriteStream.on('error', (err) => {
+          console.error('File write error:', err);
+          if (!res.headersSent) {
+            return res.status(500).json({
+              error: 'Failed to save audio file',
+              details: err.message
+            });
+          }
+        });
+        
+        downloadStream.pipe(fileWriteStream);
+        
+        fileWriteStream.on('finish', () => {
+          const fileStream = fs.createReadStream(filePath);
+          
+          fileStream.on('error', (err) => {
+            console.error('File read error:', err);
+            if (!res.headersSent) {
+              return res.status(500).json({
+                error: 'Failed to read audio file',
+                details: err.message
+              });
+            }
+          });
+          
+          fileStream.pipe(res);
+          
+          fileStream.on('end', () => {
+            // Delete the file after sending
+            fs.unlink(filePath, err => {
+              if (err) console.error('Error deleting temp file:', err);
+            });
+          });
+        });
+      }
+    } else {
+      // Download as MP4 (video)
+      const videoFormats = ytdl.filterFormats(info.formats, format => format.hasVideo && format.hasAudio);
+      
+      if (!videoFormats || videoFormats.length === 0) {
+        throw new Error('No video formats available for this video');
+      }
+      
+      let selectedFormat;
+      
+      if (quality === '720p') {
+        selectedFormat = videoFormats.find(format => format.qualityLabel === '720p') || videoFormats[0];
+      } else if (quality === '480p') {
+        selectedFormat = videoFormats.find(format => format.qualityLabel === '480p') || videoFormats[0];
+      } else {
+        selectedFormat = videoFormats.find(format => format.qualityLabel === '360p') || videoFormats[0];
+      }
+      
+      if (!selectedFormat) {
+        throw new Error('Could not select an appropriate video format');
+      }
+      
+      const fileName = `${videoTitle}.mp4`;
+      const filePath = path.join(tempDir, fileName);
+      
+      res.header('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.header('Content-Type', 'video/mp4');
+      
+      if (useYoutubeDl) {
+        // If we're using youtube-dl-exec, download directly from the URL
+        const fileUrl = selectedFormat.url;
+        
+        if (!fileUrl) {
+          throw new Error('No download URL available');
+        }
+        
+        // Use youtube-dl-exec to download the file
+        const qualityOption = quality === '720p' ? '720' : (quality === '480p' ? '480' : '360');
+        
+        const downloadProcess = youtubeDl.exec(cleanUrl, {
+          format: `bestvideo[height<=${qualityOption}]+bestaudio/best[height<=${qualityOption}]`,
+          output: filePath
+        });
+        
+        downloadProcess.then(() => {
+          const fileStream = fs.createReadStream(filePath);
+          
+          fileStream.on('error', (err) => {
+            console.error('File read error:', err);
+            if (!res.headersSent) {
+              return res.status(500).json({
+                error: 'Failed to read video file',
+                details: err.message
+              });
+            }
+          });
+          
+          fileStream.pipe(res);
+          
+          fileStream.on('end', () => {
+            // Delete the file after sending
+            fs.unlink(filePath, err => {
+              if (err) console.error('Error deleting temp file:', err);
+            });
+          });
+        }).catch((err) => {
+          console.error('youtube-dl-exec download error:', err);
+          if (!res.headersSent) {
+            return res.status(500).json({
+              error: 'Failed to download video',
+              details: err.message
+            });
+          }
+        });
+      } else {
+        // Use ytdl-core for downloading
+        const downloadStream = ytdl(cleanUrl, {
+          format: selectedFormat,
+          requestOptions: {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            }
+          }
+        });
+        
+        // Handle download stream errors
+        downloadStream.on('error', (err) => {
+          console.error('Download stream error:', err);
+          if (!res.headersSent) {
+            return res.status(500).json({
+              error: 'Failed to download video',
+              details: err.message
+            });
+          }
+        });
+        
+        downloadStream.pipe(res);
+      }
+    }
+  } catch (error) {
+    console.error('Error downloading YouTube video:', error.message);
+    console.error('Stack trace:', error.stack);
+    return res.status(500).json({
+      error: 'Failed to download video',
+      details: error.message
+    });
+  }
+});
+
+// Mock API endpoint for TikTok downloads (for demonstration purposes)
+app.get('/api/download/tiktok', (req, res) => {
+  const { format, quality, watermark } = req.query;
+  
+  // This is just a mock implementation that returns a placeholder file
+  res.header('Content-Disposition', `attachment; filename="tiktok-video.${format}"`);
+  
+  if (format === 'mp3') {
+    res.header('Content-Type', 'audio/mpeg');
+    res.send('This is a placeholder for TikTok audio download');
+  } else {
+    res.header('Content-Type', 'video/mp4');
+    res.send('This is a placeholder for TikTok video download');
+  }
+});
+
+// Mock API endpoint for Facebook downloads (for demonstration purposes)
+app.get('/api/download/facebook', (req, res) => {
+  const { format, quality } = req.query;
+  
+  // This is just a mock implementation that returns a placeholder file
+  res.header('Content-Disposition', `attachment; filename="facebook-video.${format}"`);
+  
+  if (format === 'mp3') {
+    res.header('Content-Type', 'audio/mpeg');
+    res.send('This is a placeholder for Facebook audio download');
+  } else {
+    res.header('Content-Type', 'video/mp4');
+    res.send('This is a placeholder for Facebook video download');
+  }
+});
+
+// Helper function to format duration
+function formatDuration(seconds) {
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return `${minutes}:${remainingSeconds < 10 ? '0' : ''}${remainingSeconds}`;
+}
+
+// Helper function to get YouTube formats
+function getYouTubeFormats(formats) {
+  try {
+    if (!formats || !Array.isArray(formats)) {
+      console.error('Invalid formats provided to getYouTubeFormats:', formats);
+      return getDefaultFormats();
+    }
+    
+    const result = [];
+    
+    // Get video formats with audio
+    const videoFormats = ytdl.filterFormats(formats, format => format.hasVideo && format.hasAudio);
+    
+    // 720p
+    const format720 = videoFormats.find(format => format.qualityLabel === '720p');
+    if (format720) {
+      result.push({
+        id: 'yt-mp4-720',
+        format: 'mp4',
+        quality: '720p',
+        type: 'video',
+        size: formatBytes(format720.contentLength)
+      });
+    }
+    
+    // 480p
+    const format480 = videoFormats.find(format => format.qualityLabel === '480p');
+    if (format480) {
+      result.push({
+        id: 'yt-mp4-480',
+        format: 'mp4',
+        quality: '480p',
+        type: 'video',
+        size: formatBytes(format480.contentLength)
+      });
+    }
+    
+    // 360p
+    const format360 = videoFormats.find(format => format.qualityLabel === '360p');
+    if (format360) {
+      result.push({
+        id: 'yt-mp4-360',
+        format: 'mp4',
+        quality: '360p',
+        type: 'video',
+        size: formatBytes(format360.contentLength)
+      });
+    }
+    
+    // If no video formats were found, add a default one
+    if (result.length === 0) {
+      result.push({
+        id: 'yt-mp4-360',
+        format: 'mp4',
+        quality: '360p',
+        type: 'video',
+        size: 'Unknown'
+      });
+    }
+    
+    // Audio formats
+    const audioFormats = ytdl.filterFormats(formats, 'audioonly');
+    
+    if (audioFormats && audioFormats.length > 0) {
+      // High quality audio
+      const highAudio = audioFormats.reduce((prev, curr) => 
+        prev.audioBitrate > curr.audioBitrate ? prev : curr
+      );
+      
+      if (highAudio) {
+        result.push({
+          id: 'yt-mp3-high',
+          format: 'mp3',
+          quality: 'High',
+          type: 'audio',
+          size: formatBytes(highAudio.contentLength)
+        });
+      }
+      
+      // Medium quality audio
+      if (highAudio && highAudio.audioBitrate) {
+        const mediumAudio = audioFormats.find(format => 
+          format.audioBitrate < highAudio.audioBitrate && format.audioBitrate >= 128
+        );
+        
+        if (mediumAudio) {
+          result.push({
+            id: 'yt-mp3-medium',
+            format: 'mp3',
+            quality: 'Medium',
+            type: 'audio',
+            size: formatBytes(mediumAudio.contentLength)
+          });
+        }
+      }
+    } else {
+      // Add a default audio option if none were found
+      result.push({
+        id: 'yt-mp3-high',
+        format: 'mp3',
+        quality: 'High',
+        type: 'audio',
+        size: 'Unknown'
+      });
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error in getYouTubeFormats:', error);
+    return getDefaultFormats();
+  }
+}
+
+// Helper function to get default formats when there's an error
+function getDefaultFormats() {
+  return [
+    { id: 'yt-mp4-720', format: 'mp4', quality: '720p', type: 'video', size: 'Unknown' },
+    { id: 'yt-mp4-480', format: 'mp4', quality: '480p', type: 'video', size: 'Unknown' },
+    { id: 'yt-mp3-high', format: 'mp3', quality: 'High', type: 'audio', size: 'Unknown' }
+  ];
+}
+
+// Helper function to format bytes
+function formatBytes(bytes) {
+  if (!bytes) return 'Unknown';
+  
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  if (bytes === 0) return '0 Byte';
+  const i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
+  return Math.round(bytes / Math.pow(1024, i), 2) + ' ' + sizes[i];
+}
+
+// Serve React app
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../build', 'index.html'));
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const { exec } = require('child_process');
+const ytdl = require('ytdl-core');
+const app = express();
+const PORT = process.env.PORT || 5001; // Changed from 5000 to 5001 to avoid conflicts
+
+// Middleware
+app.use(cors({
+  origin: 'http://localhost:3000',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json());
+app.use(express.static(path.join(__dirname, '../build')));
+
+// Create temp directory if it doesn't exist
+const tempDir = path.join(__dirname, 'temp');
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir);
+}
+
+// Helper function to clean up temp files
+const cleanupTempFiles = () => {
+  fs.readdir(tempDir, (err, files) => {
+    if (err) return console.error(err);
+    
+    // Delete files older than 1 hour
+    const now = Date.now();
+    files.forEach(file => {
+      const filePath = path.join(tempDir, file);
+      fs.stat(filePath, (err, stats) => {
+        if (err) return console.error(err);
+        
+        // If file is older than 1 hour, delete it
+        if (now - stats.mtime.getTime() > 3600000) {
+          fs.unlink(filePath, err => {
+            if (err) console.error(err);
+          });
+        }
+      });
+    });
+  });
+};
+
+// Clean up temp files every hour
+setInterval(cleanupTempFiles, 3600000);
+
+// Test endpoint to verify server is working
+app.get('/api/test', (req, res) => {
+  res.json({ status: 'ok', message: 'Server is running correctly' });
+});
+
+// API endpoint to get video info
+app.post('/api/info', async (req, res) => {
+  const { url } = req.body;
+  
+  if (!url) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+  
+  try {
+    // Detect platform
+    let platform;
+    if (url.includes('youtube.com') || url.includes('youtu.be')) {
+      platform = 'youtube';
+      
+      try {
+        // Clean the URL to remove any extra parameters
+        let videoId, cleanUrl;
+        try {
+          videoId = ytdl.getVideoID(url);
+          cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
+          console.log('Processing YouTube video ID:', videoId);
+        } catch (idError) {
+          console.error('Error extracting video ID:', idError);
+          // If we can't extract the ID, use the original URL
+          cleanUrl = url;
+        }
+        
+        // Get YouTube video info with additional options to handle age-restricted videos
+        const info = await ytdl.getInfo(cleanUrl, {
+          requestOptions: {
+            headers: {
+              // Add a user agent to mimic a browser request
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+              'Accept-Language': 'en-US,en;q=0.9'
+            }
+          }
+        });
+        
+        if (!info || !info.videoDetails) {
+          throw new Error('Failed to retrieve video details');
+        }
+        
+        return res.json({
+          platform,
+          videoInfo: {
+            title: info.videoDetails.title || 'Unknown Title',
+            thumbnail: info.videoDetails.thumbnails && info.videoDetails.thumbnails.length > 0 
+              ? info.videoDetails.thumbnails[info.videoDetails.thumbnails.length - 1].url 
+              : 'https://via.placeholder.com/640x360/4a6cf7/ffffff?text=YouTube+Video',
+            duration: info.videoDetails.lengthSeconds 
+              ? formatDuration(parseInt(info.videoDetails.lengthSeconds)) 
+              : '0:00',
+            author: info.videoDetails.author ? info.videoDetails.author.name : 'Unknown Author',
+          },
+          formats: getYouTubeFormats(info.formats)
+        });
+      } catch (ytError) {
+        console.error('YouTube specific error:', ytError);
+        
+        // Return a fallback response for demonstration purposes
+        return res.json({
+          platform,
+          videoInfo: {
+            title: 'YouTube Video (Error retrieving details)',
+            thumbnail: 'https://via.placeholder.com/640x360/4a6cf7/ffffff?text=YouTube+Video',
+            duration: '0:00',
+            author: 'Unknown',
+          },
+          formats: [
+            { id: 'yt-mp4-720', format: 'mp4', quality: '720p', type: 'video', size: 'Unknown' },
+            { id: 'yt-mp4-480', format: 'mp4', quality: '480p', type: 'video', size: 'Unknown' },
+            { id: 'yt-mp3-high', format: 'mp3', quality: 'High', type: 'audio', size: 'Unknown' }
+          ]
+        });
+      }
+    } else if (url.includes('tiktok.com')) {
+      platform = 'tiktok';
+      
+      // For TikTok, we'd need to implement a custom solution
+      // This is a placeholder for demonstration
+      return res.json({
+        platform,
+        videoInfo: {
+          title: 'TikTok Video',
+          thumbnail: 'https://via.placeholder.com/640x360/4a6cf7/ffffff?text=TikTok+Video',
+          duration: '0:30',
+          author: 'TikTok User',
+        },
+        formats: [
+          { id: 'tt-mp4-hd-nowm', format: 'mp4', quality: 'HD', type: 'video', watermark: false, size: '8.7 MB' },
+          { id: 'tt-mp4-hd-wm', format: 'mp4', quality: 'HD', type: 'video', watermark: true, size: '8.7 MB' },
+          { id: 'tt-mp4-sd-nowm', format: 'mp4', quality: 'SD', type: 'video', watermark: false, size: '5.3 MB' },
+          { id: 'tt-mp4-sd-wm', format: 'mp4', quality: 'SD', type: 'video', watermark: true, size: '5.3 MB' },
+          { id: 'tt-mp3', format: 'mp3', quality: 'High', type: 'audio', size: '1.8 MB' }
+        ]
+      });
+    } else if (url.includes('facebook.com') || url.includes('fb.watch')) {
+      platform = 'facebook';
+      
+      // For Facebook, we'd need to implement a custom solution
+      // This is a placeholder for demonstration
+      return res.json({
+        platform,
+        videoInfo: {
+          title: 'Facebook Video',
+          thumbnail: 'https://via.placeholder.com/640x360/4a6cf7/ffffff?text=Facebook+Video',
+          duration: '2:15',
+          author: 'Facebook User',
+        },
+        formats: [
+          { id: 'fb-mp4-hd', format: 'mp4', quality: 'HD', type: 'video', size: '18.2 MB' },
+          { id: 'fb-mp4-sd', format: 'mp4', quality: 'SD', type: 'video', size: '9.6 MB' },
+          { id: 'fb-mp3', format: 'mp3', quality: 'High', type: 'audio', size: '2.9 MB' }
+        ]
+      });
+    } else {
+      return res.status(400).json({ error: 'Unsupported platform' });
+    }
+  } catch (error) {
+    console.error('Error fetching video info:', error.message);
+    console.error('Stack trace:', error.stack);
+    return res.status(500).json({
+      error: 'Failed to fetch video information',
+      details: error.message
+    });
+  }
+});
+
+// API endpoint to download YouTube videos
+app.get('/api/download/youtube', async (req, res) => {
+  const { url, format, quality } = req.query;
+  
+  if (!url) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+  
+  try {
+    // Clean the URL to remove any extra parameters
+    let videoId, cleanUrl;
+    try {
+      videoId = ytdl.getVideoID(url);
+      cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      console.log('Processing YouTube video ID:', videoId);
+    } catch (idError) {
+      console.error('Error extracting video ID:', idError);
+      // If we can't extract the ID, use the original URL
+      cleanUrl = url;
+    }
+    
+    // Try to get video info with additional options to handle age-restricted videos
+    const info = await ytdl.getInfo(cleanUrl, {
+      requestOptions: {
+        headers: {
+          // Add a user agent to mimic a browser request
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9'
+        }
+      }
+    });
+    
+    if (!info || !info.videoDetails) {
+      throw new Error('Could not retrieve video details');
+    }
+    
+    const videoTitle = info.videoDetails.title.replace(/[^\w\s]/gi, '') || 'video';
+    
+    if (format === 'mp3') {
+      // Download as MP3 (audio only)
+      const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
+      
+      if (!audioFormats || audioFormats.length === 0) {
+        throw new Error('No audio formats available for this video');
+      }
+      
+      let selectedFormat;
+      
+      if (quality === 'High') {
+        selectedFormat = audioFormats.reduce((prev, curr) =>
+          (prev.audioBitrate || 0) > (curr.audioBitrate || 0) ? prev : curr
+        );
+      } else {
+        selectedFormat = audioFormats.reduce((prev, curr) =>
+          (prev.audioBitrate || 0) < (curr.audioBitrate || 0) ? prev : curr
+        );
+      }
+      
+      if (!selectedFormat) {
+        throw new Error('Could not select an appropriate audio format');
+      }
+      
+      const fileName = `${videoTitle}.mp3`;
+      const filePath = path.join(tempDir, fileName);
+      
+      res.header('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.header('Content-Type', 'audio/mpeg');
+      
+      // Create a download stream with error handling
+      const downloadStream = ytdl(cleanUrl, {
+        format: selectedFormat,
+        requestOptions: {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          }
+        }
+      });
+      
+      // Handle download stream errors
+      downloadStream.on('error', (err) => {
+        console.error('Download stream error:', err);
+        if (!res.headersSent) {
+          return res.status(500).json({
+            error: 'Failed to download audio',
+            details: err.message
+          });
+        }
+      });
+      
+      const fileWriteStream = fs.createWriteStream(filePath);
+      
+      fileWriteStream.on('error', (err) => {
+        console.error('File write error:', err);
+        if (!res.headersSent) {
+          return res.status(500).json({
+            error: 'Failed to save audio file',
+            details: err.message
+          });
+        }
+      });
+      
+      downloadStream.pipe(fileWriteStream);
+      
+      fileWriteStream.on('finish', () => {
+        const fileStream = fs.createReadStream(filePath);
+        
+        fileStream.on('error', (err) => {
+          console.error('File read error:', err);
+          if (!res.headersSent) {
+            return res.status(500).json({
+              error: 'Failed to read audio file',
+              details: err.message
+            });
+          }
+        });
+        
+        fileStream.pipe(res);
+        
+        fileStream.on('end', () => {
+          // Delete the file after sending
+          fs.unlink(filePath, err => {
+            if (err) console.error('Error deleting temp file:', err);
+          });
+        });
+      });
+    } else {
+      // Download as MP4 (video)
+      const videoFormats = ytdl.filterFormats(info.formats, format => format.hasVideo && format.hasAudio);
+      
+      if (!videoFormats || videoFormats.length === 0) {
+        throw new Error('No video formats available for this video');
+      }
+      
+      let selectedFormat;
+      
+      if (quality === '720p') {
+        selectedFormat = videoFormats.find(format => format.qualityLabel === '720p') || videoFormats[0];
+      } else if (quality === '480p') {
+        selectedFormat = videoFormats.find(format => format.qualityLabel === '480p') || videoFormats[0];
+      } else {
+        selectedFormat = videoFormats.find(format => format.qualityLabel === '360p') || videoFormats[0];
+      }
+      
+      if (!selectedFormat) {
+        throw new Error('Could not select an appropriate video format');
+      }
+      
+      const fileName = `${videoTitle}.mp4`;
+      
+      res.header('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.header('Content-Type', 'video/mp4');
+      
+      // Create a download stream with error handling
+      const downloadStream = ytdl(cleanUrl, {
+        format: selectedFormat,
+        requestOptions: {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          }
+        }
+      });
+      
+      // Handle download stream errors
+      downloadStream.on('error', (err) => {
+        console.error('Download stream error:', err);
+        if (!res.headersSent) {
+          return res.status(500).json({
+            error: 'Failed to download video',
+            details: err.message
+          });
+        }
+      });
+      
+      downloadStream.pipe(res);
+    }
+  } catch (error) {
+    console.error('Error downloading YouTube video:', error.message);
+    console.error('Stack trace:', error.stack);
+    return res.status(500).json({
+      error: 'Failed to download video',
+      details: error.message
+    });
+  }
+});
+
+// Mock API endpoint for TikTok downloads (for demonstration purposes)
+app.get('/api/download/tiktok', (req, res) => {
+  const { format, quality, watermark } = req.query;
+  
+  // This is just a mock implementation that returns a placeholder file
+  res.header('Content-Disposition', `attachment; filename="tiktok-video.${format}"`);
+  
+  if (format === 'mp3') {
+    res.header('Content-Type', 'audio/mpeg');
+    res.send('This is a placeholder for TikTok audio download');
+  } else {
+    res.header('Content-Type', 'video/mp4');
+    res.send('This is a placeholder for TikTok video download');
+  }
+});
+
+// Mock API endpoint for Facebook downloads (for demonstration purposes)
+app.get('/api/download/facebook', (req, res) => {
+  const { format, quality } = req.query;
+  
+  // This is just a mock implementation that returns a placeholder file
+  res.header('Content-Disposition', `attachment; filename="facebook-video.${format}"`);
+  
+  if (format === 'mp3') {
+    res.header('Content-Type', 'audio/mpeg');
+    res.send('This is a placeholder for Facebook audio download');
+  } else {
+    res.header('Content-Type', 'video/mp4');
+    res.send('This is a placeholder for Facebook video download');
+  }
+});
+
+// Helper function to format duration
+function formatDuration(seconds) {
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return `${minutes}:${remainingSeconds < 10 ? '0' : ''}${remainingSeconds}`;
+}
+
+// Helper function to get YouTube formats
+function getYouTubeFormats(formats) {
+  try {
+    if (!formats || !Array.isArray(formats)) {
+      console.error('Invalid formats provided to getYouTubeFormats:', formats);
+      return getDefaultFormats();
+    }
+    
+    const result = [];
+    
+    // Get video formats with audio
+    const videoFormats = ytdl.filterFormats(formats, format => format.hasVideo && format.hasAudio);
+    
+    // 720p
+    const format720 = videoFormats.find(format => format.qualityLabel === '720p');
+    if (format720) {
+      result.push({
+        id: 'yt-mp4-720',
+        format: 'mp4',
+        quality: '720p',
+        type: 'video',
+        size: formatBytes(format720.contentLength)
+      });
+    }
+    
+    // 480p
+    const format480 = videoFormats.find(format => format.qualityLabel === '480p');
+    if (format480) {
+      result.push({
+        id: 'yt-mp4-480',
+        format: 'mp4',
+        quality: '480p',
+        type: 'video',
+        size: formatBytes(format480.contentLength)
+      });
+    }
+    
+    // 360p
+    const format360 = videoFormats.find(format => format.qualityLabel === '360p');
+    if (format360) {
+      result.push({
+        id: 'yt-mp4-360',
+        format: 'mp4',
+        quality: '360p',
+        type: 'video',
+        size: formatBytes(format360.contentLength)
+      });
+    }
+    
+    // If no video formats were found, add a default one
+    if (result.length === 0) {
+      result.push({
+        id: 'yt-mp4-360',
+        format: 'mp4',
+        quality: '360p',
+        type: 'video',
+        size: 'Unknown'
+      });
+    }
+    
+    // Audio formats
+    const audioFormats = ytdl.filterFormats(formats, 'audioonly');
+    
+    if (audioFormats && audioFormats.length > 0) {
+      // High quality audio
+      const highAudio = audioFormats.reduce((prev, curr) => 
+        prev.audioBitrate > curr.audioBitrate ? prev : curr
+      );
+      
+      if (highAudio) {
+        result.push({
+          id: 'yt-mp3-high',
+          format: 'mp3',
+          quality: 'High',
+          type: 'audio',
+          size: formatBytes(highAudio.contentLength)
+        });
+      }
+      
+      // Medium quality audio
+      if (highAudio && highAudio.audioBitrate) {
+        const mediumAudio = audioFormats.find(format => 
+          format.audioBitrate < highAudio.audioBitrate && format.audioBitrate >= 128
+        );
+        
+        if (mediumAudio) {
+          result.push({
+            id: 'yt-mp3-medium',
+            format: 'mp3',
+            quality: 'Medium',
+            type: 'audio',
+            size: formatBytes(mediumAudio.contentLength)
+          });
+        }
+      }
+    } else {
+      // Add a default audio option if none were found
+      result.push({
+        id: 'yt-mp3-high',
+        format: 'mp3',
+        quality: 'High',
+        type: 'audio',
+        size: 'Unknown'
+      });
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error in getYouTubeFormats:', error);
+    return getDefaultFormats();
+  }
+}
+
+// Helper function to get default formats when there's an error
+function getDefaultFormats() {
+  return [
+    { id: 'yt-mp4-720', format: 'mp4', quality: '720p', type: 'video', size: 'Unknown' },
+    { id: 'yt-mp4-480', format: 'mp4', quality: '480p', type: 'video', size: 'Unknown' },
+    { id: 'yt-mp3-high', format: 'mp3', quality: 'High', type: 'audio', size: 'Unknown' }
+  ];
+}
+
+// Helper function to format bytes
+function formatBytes(bytes) {
+  if (!bytes) return 'Unknown';
+  
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  if (bytes === 0) return '0 Byte';
+  const i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
+  return Math.round(bytes / Math.pow(1024, i), 2) + ' ' + sizes[i];
+}
+
+// Serve React app
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../build', 'index.html'));
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
